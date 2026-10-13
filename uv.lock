@@ -1,0 +1,31 @@
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[manifest]
+members = [
+    "toolflow",
+    "toolflow-core",
+    "toolflow-langchain",
+]
+
+[[package]]
+name = "toolflow"
+version = "0.1.0"
+source = { virtual = "." }
+
+[[package]]
+name = "toolflow-core"
+version = "0.1.0"
+source = { editable = "packages/toolflow-core" }
+
+[[package]]
+name = "toolflow-langchain"
+version = "0.1.0"
+source = { editable = "packages/toolflow-langchain" }
+dependencies = [
+    { name = "toolflow-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "toolflow-core", editable = "packages/toolflow-core" }]
