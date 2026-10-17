@@ -1,2 +1,1 @@
-def hello() -> str:
-    return "Hello from toolflow-core!"
+"""toolflow-core：构件与适配器的核心契约。"""
