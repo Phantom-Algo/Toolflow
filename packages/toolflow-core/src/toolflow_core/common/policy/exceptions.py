@@ -36,5 +36,43 @@ class PolicyConflictError(PolicyError):
         self.current_revision = current_revision
 
 
-class PolicyLoadError(PolicyError):
-    """A configuration source could not be read or decoded."""
+class PolicyManagerNotFoundError(PolicyError, LookupError):
+    """No persisted policy exists for the requested manager key."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"No policy found for {key!r}")
+        self.key = key
+
+
+class PolicyCacheError(PolicyError):
+    """A cache adapter violated the manager identity contract."""
+
+
+class PolicySourceConflictError(PolicyError):
+    """The source record was removed or its version no longer matches."""
+
+    def __init__(self, key: str, *, expected_source_version: str) -> None:
+        super().__init__(
+            f"Source policy changed or disappeared for {key!r} "
+            f"(expected version: {expected_source_version!r})"
+        )
+        self.key = key
+        self.expected_source_version = expected_source_version
+
+
+class PolicyWriteRejectedError(PolicyError):
+    """Persistence confirms no commit occurred and no write remains in flight."""
+
+
+class PolicyWriteUncertainError(PolicyError):
+    """Persistence cannot establish whether a write committed or is in flight."""
+
+
+class PolicyUnavailableError(PolicyError):
+    """A manager is blocked until its source state has been reconciled."""
+
+    def __init__(self, key: str, *, uncertain: bool) -> None:
+        action = "recover with a write resolver" if uncertain else "reload the source"
+        super().__init__(f"Policy {key!r} is unavailable; {action}")
+        self.key = key
+        self.uncertain = uncertain

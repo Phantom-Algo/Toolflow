@@ -22,7 +22,7 @@ class ScopeDecision:
 
 
 @dataclass(frozen=True)
-class PermissionFilterResult:
+class PermissionCheckerResult:
 
     tool_call: ToolCall
     result: Effect

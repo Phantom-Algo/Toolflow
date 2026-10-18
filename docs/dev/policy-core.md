@@ -1,14 +1,24 @@
 # Policy 内核使用指南
 
-Policy 内核位于 `toolflow_core.common.policy`，提供进程内的不可变配置快照与线程安全更新。文件、DB、远程仓库通过异步 Loader 提供配置数据，领域模型负责校验，Manager 负责发布。Loader 与重载入口为异步接口；模型、Builder 和 Manager 保持同步。
+Policy 内核位于 `toolflow_core.common.policy`。Policy 表达不可变配置，Manager 提供异步读取与“先持久化、后发布”的更新，Repo 负责按逻辑身份复用 Manager。DB / 文件客户端由应用通过 `PolicyStore` 接入。
+
+实现与验证状态见 [2026-10-18 实施方案](plan/261018-policy-manager-repo-plan.md)。本文代码使用 Python 3.13；示例中的 `await` 需放在异步函数内，`store` 和配置 key 由应用提供。
+
+## 从原同步接口迁移
+
+| 原用法 | 当前用法 |
+| --- | --- |
+| `PolicyManager(policy)` | 优先 `await repo.get(key)`；直接构造必须传入 `StoredPolicy`、`key` 和 `store` |
+| 同步 `snapshot / replace / update` | 全部使用 `await`；Resolver 的 `resolve` 和 Gateway 的 `prepare` 同样异步 |
+| 内存更新后由调用方选择保存 | Manager 统一先保存再发布，不提供默认空写入器，也不需要在成功更新后重复保存 |
+
+优先通过共享 Repo 获取 Manager。直接构造的独立 Manager 不受 Repo 的实例注册与阻断保留机制管理，不适合用于同一逻辑身份的全局共享入口。
 
 ## 定义领域配置
 
 ```python
 from collections.abc import Mapping
-
 from pydantic import Field
-
 from toolflow_core.common.policy import BasePolicy
 
 
@@ -21,178 +31,153 @@ class RuntimePolicy(BasePolicy):
 
 支持标量 `str`、`bool`、`int`、有限 `float`、`None`，以及 `Literal`、联合类型、嵌套 `BasePolicy`、`tuple`、`frozenset` 和 `Mapping[str, T]`。集合成员同样必须是支持的类型。
 
-不要将 `list`、`dict`、`set`、`Any` 或客户端对象声明为领域字段；不支持的声明在模型完成初始化时抛出 `PolicyImmutabilityError`。原始配置仍可使用普通 JSON 字典和列表，模型负责转换。
+领域字段不使用 `list`、`dict`、`set`、`Any` 或客户端对象；不支持的声明在模型完成初始化时抛出 `PolicyImmutabilityError`。原始 JSON / DB 数据可以使用普通字典和列表，模型负责转换并递归冻结。保留 BasePolicy 的冻结、默认值校验和重新校验配置，不添加可变私有状态，校验器与查询方法保持纯函数。
 
-继承时保留 BasePolicy 的冻结、默认值校验和重新校验配置。校验器与查询方法保持纯函数，不向 Policy 添加私有状态或缓存。
+`PolicyType.from_config(raw)` 校验并隔离原始数据；`policy.to_config()` 返回独立的普通容器；`policy.with_changes(**changes)` 执行顶层字段替换及完整校验，不递归合并 Mapping。不要使用不会校验更新值的 `model_copy(update=...)` 绕过这些入口。Manager 仍会在加载及发布边界重新校验。
 
-## 初始化与读取
+## 实现数据源
+
+应用实现 `PolicyStore[TPolicy]` 的两个异步方法：
 
 ```python
-from toolflow_core.common.policy import PolicyManager
+from toolflow_core.common.policy import PolicyStore, StoredPolicy
 
-initial = RuntimePolicy.from_config({
-    "timeout_ms": 3000,
-    "allowed_tools": ["search", "read"],
-    "tool_timeouts": {"search": 1000},
-})
-manager = PolicyManager(initial)
 
-# 一次 request / task / 过滤链取得一次快照。
-snapshot = manager.snapshot()
-policy = snapshot.policy
-timeout = policy.tool_timeouts.get("search", policy.timeout_ms)
+class RuntimePolicyStore(PolicyStore[RuntimePolicy]):
+    async def load(self, key: str) -> StoredPolicy[RuntimePolicy] | None:
+        # Read one complete policy/version pair from the authoritative source.
+        ...
+
+    async def save(
+        self,
+        key: str,
+        candidate: RuntimePolicy,
+        *,
+        expected_source_version: str,
+    ) -> str:
+        # Atomically compare the source version and commit the entire candidate.
+        # Return a fresh version only after persistence confirms the commit.
+        ...
 ```
 
-将同一个 Manager 注入消费者，消费者每次开始操作时读取快照。读取只在取得快照引用时短暂持锁；业务逻辑使用该快照时不持锁。旧快照保持有效，不会随热更新修改。
+`load()` 返回已校验的 `StoredPolicy(policy, source_version)`，配置不存在时返回 `None`。版本为非空字符串，每次成功保存都变化，删除再创建也不能复用旧版本。`save()` 不得隐式修改候选配置的业务字段，不能把版本不匹配转换成无条件覆盖。
 
-初始 `revision` 为 0，每次发布成功加 1；它只在当前 Manager 的生命周期内有意义，不是数据库版本，也不能用于跨进程排序。
+| 写入结果 | 适配器行为 | Manager 行为 |
+| --- | --- | --- |
+| 确认提交 | 返回新源版本 | 发布新内存快照 |
+| 版本不匹配或记录已删除 | 抛 `PolicySourceConflictError` | 保持旧快照，阻断新访问，等待显式 reload |
+| 确认未提交且没有在途写入 | 抛 `PolicyWriteRejectedError` | 保持旧快照，允许后续读取和重试 |
+| 提交结果不确定 | 抛 `PolicyWriteUncertainError` | 阻断该 key，等待显式恢复 |
+| 其他写入异常或内部任务取消 | 传播原异常 | 按结果不确定处理 |
 
-## 修改配置与处理冲突
+DB 适配器应使用源端事务 / CAS，文件适配器需实现版本检查、写者互斥和完整替换。单纯原子替换文件不能防止旧写者覆盖新内容。同步 I/O 应在线程中执行；取消 `to_thread()` 的等待不表示底层写入已停止。
+
+## 获取共享 Manager
 
 ```python
-from toolflow_core.common.policy import PolicyConflictError
+from toolflow_core.common.policy import CachetoolsPolicyManagerRepo
 
-base = manager.snapshot()
+# Construct once per application policy namespace; inject this repo into consumers.
+repo = CachetoolsPolicyManagerRepo(store, ttl=60.0, maxsize=1024)
+
+# Inside an async operation:
+manager = await repo.get(agent_key)
+snapshot = await manager.snapshot()
+timeout = snapshot.policy.timeout_ms
+```
+
+Repo 缓存 Manager 对象引用，而不是复制 Policy。每个 Repo 对应一种 Policy 及源命名空间，key 必须稳定、无拼接歧义，并包含必要的用户隔离维度：
+
+| Scope | 逻辑身份 |
+| --- | --- |
+| Application | user_id |
+| Agent | user_id + agent_id，不包含 session_id |
+| Session | user_id + session_id |
+
+同一 Agent 在多个 Session 中获取同一个 Manager。应用需要复用同一个 Repo；不同 Repo / 进程不共享 Python 对象身份。
+
+key 的组合应使用明确编码，例如 `agent_key = json.dumps([user_id, agent_id], ensure_ascii=False, separators=(",", ":"))`（需 `import json`），并与源存储使用的 key 一致。初次回源查无配置时，`get()` 抛出 `PolicyManagerNotFoundError`，不缓存缺失结果；源读取和缓存异常直接传播。
+
+TTL 仅控制 Repo 的强引用保留时间，不表示 Policy 新鲜度。读命中和 Manager 更新不续期；容量淘汰可以早于 TTL。缓存未命中后先检查弱引用注册表：有存活实例就重新缓存并返回它，没有才读源并创建。对象仍存活时始终保持身份；所有引用释放后允许回收，下次按持久化配置重建。过期对象的物理清理由后续缓存访问触发，不启动后台线程。
+
+默认实现要求 `ttl` 为有限正数（秒）、`maxsize` 为正整数；默认值分别是 60 和 1024。Repo 通过固定 64 把异步分段锁协调 Manager；不同 key 可能因分段碰撞而等待。
+
+需要自定义缓存时，继承 `BasePolicyManagerRepo`，调用 `super().__init__(store, ttl=...)` 并实现 `_read_cache()`、`_read_source()`、`_write_cache()` 三个异步钩子；读源钩子须与写入 Store 使用相同权威源。基类提供 get、身份管理和恢复流程。缓存必须保存原对象并支持 TTL，不能把 Manager 序列化到 Redis 后重建。
+
+自定义缓存读取时，需清理已过期项占用的强引用，再让基类查询弱引用注册表。仅返回 None 却仍保留过期对象，会使其一直被视为存活，无法按预期回收。三个钩子在共享锁内执行，不得重入相同 Repo / Manager。
+
+## 修改配置
+
+```python
+from toolflow_core.common.policy import PolicyConflictError, PolicySourceConflictError
+
+base = await manager.snapshot()
 candidate = base.policy.with_changes(timeout_ms=5000)
-
 try:
-    published = manager.replace(candidate, expected=base)
+    published = await manager.replace(candidate, expected=base)
 except PolicyConflictError:
-    # 期间有其他写者成功发布。由应用决定重新读取、合并修改或提示用户。
+    # Re-read the current snapshot and decide how to merge; no hidden retry.
     raise
-```
+except PolicySourceConflictError:
+    # Another source writer won. Reload explicitly before deciding to retry.
+    await repo.reload(agent_key)
+    raise
 
-`expected` 必须是该 Manager 当前返回的原始快照对象，不能自行构造，也不能使用另一个 Manager 的同号快照。发布在锁内检查对象身份，再整体替换引用；冲突不会修改内存状态。
-
-也可以使用纯函数形式：
-
-```python
-base = manager.snapshot()
-published = manager.update(
-    lambda policy: policy.with_changes(retry_limit=3),
-    expected=base,
+# Alternatively, run a synchronous pure transform exactly once.
+base = await manager.snapshot()
+published = await manager.update(
+    lambda policy: policy.with_changes(retry_limit=3), expected=base
 )
 ```
 
-`update()` 在快照已失效时直接报冲突；否则在锁外调用一次 transform，再检查并发布。不会自动重试 transform，因此应用不必担心隐藏的重复调用。回调仍应保持纯函数，避免配置发布失败后留下外部副作用。
+`expected` 必须是该 Manager 当前返回的快照原对象，其他 Manager、伪造或过期快照均被拒绝。候选 Policy 在锁外校验；锁内依次检查快照身份、等待源端条件保存、整体替换内存快照。保存期间 `snapshot()`、同 key 的 Repo 获取及重载均等待，事件循环仍能处理其他分段的工作。transform 是同步纯函数，不做阻塞 I/O，不自动重试。
 
-`with_changes()` 按顶层字段替换，不递归合并字典，并重新校验全部字段约束。可以显式构建嵌套修改：
+`revision` 从 0 开始，是本地发布计数；`source_version` 用于源端 CAS。重建 Manager 后 `revision` 可以重新从 0 开始，不能跨实例排序。旧快照始终保持原值；已经取得的快照和正在运行的业务不会被撤回。
 
-```python
-base = manager.snapshot()
-timeouts = dict(base.policy.tool_timeouts)
-timeouts["search"] = 2000
-published = manager.replace(
-    base.policy.with_changes(tool_timeouts=timeouts),
-    expected=base,
-)
-```
+开始提交之前可以取消；开始提交之后延迟传播调用者取消，等完整的保存及发布结束后才解锁。多次取消也不提前释放锁。调用方收到取消仍可能已经提交，不应盲目重试；应用关闭时应等待在途更新完成。
 
-Manager 在初始化和发布前会重新校验、隔离候选模型，不信任 `model_construct()` 或 `model_copy(update=...)` 产生的对象。推荐统一使用 `from_config()`、`with_changes()`。直接调用 Pydantic 构造函数也会冻结容器，但其字段错误保留 Pydantic 的 `ValidationError`。
-
-## 接入文件、DB 或远程配置
-
-实现 `async def load() -> Mapping[str, object]` 即可，无须继承特定基类。DB / 远程配置使用客户端的原生异步 I/O；文件或同步客户端通过适配器中的 `asyncio.to_thread()` 接入，避免仅将阻塞函数声明成 `async`。
+## 显式刷新与恢复
 
 ```python
-import asyncio
-import json
-from collections.abc import Mapping
-from pathlib import Path
+# Observe external source changes while keeping the live manager object.
+manager = await repo.reload(agent_key)
 
-from toolflow_core.common.policy import reload_policy
-
-
-class JsonPolicyLoader:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    async def load(self) -> Mapping[str, object]:
-        return await asyncio.to_thread(self._read_file)
-
-    def _read_file(self) -> Mapping[str, object]:
-        raw = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("policy JSON must be an object")
-        return raw
-
-
-async def main() -> None:
-    loader = JsonPolicyLoader(Path("policy.json"))
-    initial = RuntimePolicy.from_config(await loader.load())
-    manager = PolicyManager(initial)
-    published = await reload_policy(manager, loader, RuntimePolicy.from_config)
-    print(published.revision)
-
-
-# 独立脚本入口使用；已有事件循环的应用直接 await 相应协程。
-asyncio.run(main())
+# Only after an uncertain write: the resolver must settle the original operation
+# and return the authoritative committed record (or None for confirmed absence).
+manager = await repo.recover(agent_key, resolve_previous_write)
 ```
 
-`await reload_policy()` 开始执行时，在第一次等待 I/O 前取得基线快照，然后 `await loader.load()`、构建、条件发布。期间如果有其他线程或协程成功发布，则抛出 `PolicyConflictError`，不会用较早开始的加载结果覆盖新内存状态。只创建协程对象而不等待或调度它，不会执行加载。
+源版本不变的 reload 保留原快照对象；源版本变化时校验并发布新快照。不允许同一源版本对应不同数据。加载失败不覆盖当前快照；确认源记录被删除时，存活 Manager 会被阻断，避免旧句柄继续取得配置。
 
-一次新的显式 reload 表示使用配置源替换内存，因此可以覆盖尚未保存的本地修改。不要在未确定权威源与冲突规则时直接叠加自动轮询。源端旧副本的识别、源版本顺序、多源合并和完整读取由应用或适配器负责。
+提交结果不确定时，`get()`、`snapshot()`、更新和普通 `reload()` 都不能绕过阻断；恢复标记及被阻断 Manager 的额外强引用不随 TTL 或调用者引用消失。resolver 的签名为 `Callable[[str], Awaitable[StoredPolicy[TPolicy] | None]]`，必须确认先前写入已经结束，再读取权威状态；仅再次读源或再次超时不满足恢复契约。在有效源状态安装之前，resolver / 校验失败或取消会保留已有阻断。
 
-加载阶段异常包装为 `PolicyLoadError` 并保留异常链；配置校验失败使用 `PolicyValidationError`；循环和不支持的数据结构使用 `PolicyImmutabilityError`。这些错误均不会替换现有快照。
+刷新与恢复的顺序是“读取并校验源状态 → 安装内存快照并解除阻断 → 回写缓存”。最后一步失败或被取消时，异常仍向上传播，但已经安装的状态不会回滚，Manager 也不会仅因缓存失败而重新阻断。缓存恢复可用后，调用方可以重新 `get()` 缓存这个原对象，不需要重复源写入。
 
-### 取消、超时与事件循环边界
+Repo 与 Manager 归属于一个事件循环，跨事件循环直接使用会报错。外部线程使用 `asyncio.run_coroutine_threadsafe(coro, owner_loop)`；不能在 owner_loop 所在线程调用其 Future.result()。进程内锁不提供跨进程读视图同步：源端 CAS 防止覆盖，其他进程的缓存需要显式刷新或额外同步机制。
 
-在等待 Loader 时收到 `asyncio.CancelledError`，取消直接向上传播，不包装成 `PolicyLoadError`，也不执行 Builder 或发布新快照。Loader 清理资源后应继续传播取消，不要吞掉它。[Python 取消语义](https://docs.python.org/3.13/library/asyncio-task.html#task-cancellation)
+Gateway 通过注入的 `resolve_keys(ToolCall) -> PermissionManagerKeys` 确定三个作用域的 key。当前 `prepare()` 顺序获取 Session、Agent、Application 三个 Manager，然后调用异步 Resolver；短路发生在快照读取与权限规则解析阶段，不跳过前面的 Manager 获取。因此，即使 Session 配置将拒绝调用，下游 Manager 获取失败仍会使 prepare 失败。缺少可选身份时由应用映射到明确的继承配置，不能把配置不存在或存储异常当作允许。三个作用域之间不提供原子视图。
 
-调用方可以在自己的异步函数中设置加载超时：
+## 示例与验证
 
-```python
-async with asyncio.timeout(5):
-    published = await reload_policy(manager, loader, RuntimePolicy.from_config)
-```
-
-Loader 返回之后，Builder、重新校验和条件发布在当前线程同步执行，没有新的 `await` 点。它们应短小且不包含 I/O；大配置或耗时校验仍可能阻塞事件循环，取消与超时不能中途打断这段同步代码，也不会撤销已经成功的发布。Manager 保留 `threading.Lock`，继续协调协程与其他线程的更新。
-
-如果 Loader 使用 `asyncio.to_thread()`，取消等待不代表底层读取线程立即停止；该线程稍后返回也不会由这次已取消的重载继续发布。内核不会将构建或发布本身放到后台线程。[Python 线程调用接口](https://docs.python.org/3.13/library/asyncio-task.html#running-in-threads)
-
-### 从同步版本迁移
-
-- 将 Loader 的 `def load()` 改为 `async def load()`，内部使用原生异步 I/O 或在线程中执行原有同步读取函数。
-- 初始加载改为 `RuntimePolicy.from_config(await loader.load())`。
-- 重载改为 `await reload_policy(...)`；同步脚本在最外层使用一次 `asyncio.run(main())`，不要在已有事件循环里嵌套 `asyncio.run()`。
-- `PolicyBuilder`、`snapshot()`、`replace()`、`update()` 无须加 `await`；不支持向新的重载入口直接传旧的同步 Loader。
-
-## 导出与可选持久化
-
-```python
-# 保存更新返回的精确快照。
-data = published.policy.to_config()
-payload = json.dumps(data, ensure_ascii=False)
-# 应用自行保存 payload；例如文件整体替换、DB 事务或远端 CAS。
-```
-
-`to_config()` 使用领域字段名称，返回独立的普通字典 / 列表；修改它不会影响已发布配置。也支持 Pydantic 的 `model_dump()` / `model_dump_json()`，其中 `by_alias` 等参数遵循 Pydantic 的序列化规则。
-
-内存发布成功只代表当前进程已生效。保存失败时保留内存配置，由应用记录“已生效、未保存”并决定重试。不要自动回滚，也不要并行保存不同版本而允许旧保存覆盖新保存。需要可靠持久化、源端 CAS、自动监听或多进程同步时，另行加入协调层。
-
-## 示例与测试
-
-在仓库根目录运行完整示例：
+SQLite 示例会实际提交配置，并通过独立源读取验证保存结果：
 
 ```bash
 uv run --package toolflow-core python packages/toolflow-core/examples/policy_snapshot.py
+uv run --package toolflow-core --group dev python -m pytest packages/toolflow-core/tests -q
 ```
 
-运行测试：
+完整适配器示例见 [policy_snapshot.py](../../packages/toolflow-core/examples/policy_snapshot.py)。SQLite 事务与条件 UPDATE 实现源端 CAS；它是可运行示例，不属于 Core 内置的生产存储适配器。
+
+如果本机 Anaconda Python 的 `readline` 扩展在 pytest 启动时崩溃，可以添加 `-p no:capture -p no:debugging`，跳过加载该扩展的插件。测试使用事件、Barrier、假时钟和真实 SQLite 文件验证并发顺序，不依赖定时 sleep。
+
+公共泛型关系通过 `typing_usage.py` 检查：
 
 ```bash
-uv run --package toolflow-core --group dev python -m pytest packages/toolflow-core/tests/common/policy -q
-```
-
-如果本机 Anaconda Python 的 `readline` 扩展在 pytest 启动时崩溃，可以在命令中添加 `-p no:capture -p no:debugging`，跳过会加载该扩展的插件。无需修改全局 pytest 设置。
-
-异步测试使用标准库 `asyncio.run()` 与事件控制时序，不额外依赖 pytest-asyncio；覆盖异步加载让出事件循环、并发重载冲突、取消、超时以及同步文件适配器。
-
-公共接口的泛型关系在 `typing_usage.py` 中使用 `assert_type` 验证，可以临时运行 mypy，无须增加运行时依赖：
-
-```bash
-uvx mypy --python-executable .venv/bin/python --python-version 3.13 \
-  packages/toolflow-core/src/toolflow_core/common/policy \
+uvx --with types-cachetools mypy --python-executable .venv/bin/python \
+  --python-version 3.13 packages/toolflow-core/src/toolflow_core/common/policy \
+  packages/toolflow-core/src/toolflow_core/gateway \
   packages/toolflow-core/tests/common/policy/typing_usage.py \
   packages/toolflow-core/examples/policy_snapshot.py
 ```
+
+2026-10-18 验证记录：109 项测试通过（包含 asyncio 调试模式），mypy 检查的 24 个源文件无错误；SQLite 示例运行通过。详细并发测试见 [Repo / Manager 集成测试](../../packages/toolflow-core/tests/common/policy/test_repo_integration.py) 和 [SQLite 集成测试](../../packages/toolflow-core/tests/common/policy/test_sqlite_integration.py)。

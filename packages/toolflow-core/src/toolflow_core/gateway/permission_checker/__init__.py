@@ -5,7 +5,7 @@ from .rules import decide_agent, decide_application, decide_session
 from .types import (
     DecisionSource,
     Effect,
-    PermissionFilterResult,
+    PermissionCheckerResult,
     Scope,
     ScopeDecision,
 )
@@ -13,7 +13,7 @@ from .types import (
 __all__ = [
     "DecisionSource",
     "Effect",
-    "PermissionFilterResult",
+    "PermissionCheckerResult",
     "PermissionResolver",
     "Scope",
     "ScopeDecision",

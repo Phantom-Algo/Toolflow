@@ -20,6 +20,11 @@ class ToolCall(BaseModel):
         description="tool_call's arguments which are going to be used in function calling"
     )
 
+    user_id: str = Field(
+        ...,
+        description="user_id, user's unique index"
+    )
+
     agent_id: str | None = Field(
         None,
         description="agent_id, agent's unique index"

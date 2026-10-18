@@ -1,6 +1,6 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 
-from ...common.policy import PolicyManager
+from ...common.policy import BasePolicyManager
 from ...tools import ToolCall
 from ..policy.permission import (
     ApplicationScopeToolPermissionPolicy,
@@ -8,7 +8,7 @@ from ..policy.permission import (
     SessionScopeToolPermissionPolicy,
 )
 from .rules import decide_agent, decide_application, decide_session
-from .types import PermissionFilterResult, ScopeDecision
+from .types import PermissionCheckerResult, ScopeDecision
 
 
 class PermissionResolver:
@@ -20,21 +20,21 @@ class PermissionResolver:
 
     def __init__(
         self,
-        session_manager: PolicyManager[SessionScopeToolPermissionPolicy],
-        agent_manager: PolicyManager[AgentScopeToolPermissionPolicy],
-        application_manager: PolicyManager[ApplicationScopeToolPermissionPolicy],
+        session_manager: BasePolicyManager[SessionScopeToolPermissionPolicy],
+        agent_manager: BasePolicyManager[AgentScopeToolPermissionPolicy],
+        application_manager: BasePolicyManager[ApplicationScopeToolPermissionPolicy],
     ) -> None:
         self._session_manager = session_manager
         self._agent_manager = agent_manager
         self._application_manager = application_manager
 
-    def resolve(self, tool_call: ToolCall) -> PermissionFilterResult:
+    async def resolve(self, tool_call: ToolCall) -> PermissionCheckerResult:
         decisions: list[ScopeDecision] = []
 
-        for decision in self._decisions(tool_call):
+        async for decision in self._decisions(tool_call):
             decisions.append(decision)
             if decision.effect is not None:
-                return PermissionFilterResult(
+                return PermissionCheckerResult(
                     tool_call=tool_call,
                     result=decision.effect,
                     decisions=tuple(decisions),
@@ -42,7 +42,7 @@ class PermissionResolver:
 
         raise RuntimeError("no permission scope produced a decision")
 
-    def _decisions(self, tool_call: ToolCall) -> Iterator[ScopeDecision]:
-        yield decide_session(tool_call, self._session_manager.snapshot().policy)
-        yield decide_agent(tool_call, self._agent_manager.snapshot().policy)
-        yield decide_application(tool_call, self._application_manager.snapshot().policy)
+    async def _decisions(self, tool_call: ToolCall) -> AsyncIterator[ScopeDecision]:
+        yield decide_session(tool_call, (await self._session_manager.snapshot()).policy)
+        yield decide_agent(tool_call, (await self._agent_manager.snapshot()).policy)
+        yield decide_application(tool_call, (await self._application_manager.snapshot()).policy)
